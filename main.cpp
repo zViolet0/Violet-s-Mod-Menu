@@ -13,9 +13,15 @@
 #include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
 
+#include <Geode/utils/async.hpp>
+#include <Geode/utils/file.hpp>
+
 #include <random>
 #include <chrono>
 #include <deque>
+#include <sstream>
+#include <cstdio>
+
 
 using namespace geode::prelude;
 
@@ -30,8 +36,8 @@ constexpr float POPUP_HEIGHT = 280.f;  // fixed size, so pages don't resize it
 constexpr int   SPEED_PAGE = 0;        // the page the speed slider shows on
 
 // ---- Pages ----
-static const std::array<const char*, 4> PAGE_NAMES = {
-    "Player", "Visuals", "Misc", "Labels"
+static const std::array<const char*, 5> PAGE_NAMES = {
+    "Player", "Visuals", "Misc", "Labels", "Bot"
 };
 
 // ---- Hack list: add a new line here to get a new toggle ----
@@ -42,7 +48,7 @@ struct HackEntry {
 };
 
 // ---- Hacks that's in the menu (will be adding more in the future) ----
-static const std::array<HackEntry, 19> HACKS = {{
+static const std::array<HackEntry, 21> HACKS = {{
     {"noclip",             "Noclip",             0},
     {"speedhack",          "Speedhack",          0},
     {"startpos-switcher",  "StartPos Switcher",  0},
@@ -62,6 +68,8 @@ static const std::array<HackEntry, 19> HACKS = {{
     {"cheat-indicator",    "Cheat Indicator",    3},
     {"auto-safe-mode",     "Auto Safe-Mode",     3},
     {"safe-mode",          "Safe-Mode",          3},
+    {"bot-record",         "Record",             4},
+    {"bot-replay",         "Replay",             4},
 }};
 //  ^^^^                    ^^^^
 // actual name             name that shows up
@@ -96,7 +104,7 @@ static bool g_badHackUsed = false;
 // Hacks that make a run unsafe. Edit this list freely.
 static bool badHackActive() {
     if (hackOn("noclip") || hackOn("show-hitboxes") || hackOn("frame-advance") ||
-        hackOn("speedhack") || hackOn("instant-complete")) return true;
+        hackOn("speedhack") || hackOn("instant-complete") || hackOn("bot-replay")) return true;
 
     // StartPos Switcher only counts while you're on a startpos (not "0")
     if (hackOn("startpos-switcher")) {
@@ -132,6 +140,11 @@ class $modify(HackScheduler, CCScheduler) {
         CCScheduler::update(dt * speed);
     }
 };
+
+constexpr int BOT_PAGE = 4;  // index of "Bot" in PAGE_NAMES
+
+static void saveReplayFile();
+static void loadReplayFile();
 
 // ---- The popup ----
 class HackMenu : public geode::Popup {
@@ -207,6 +220,25 @@ protected:
             m_pageNodes.push_back(label);
         }
 
+        // The Bot page also gets Save / Load buttons under its toggles
+        if (m_page == BOT_PAGE) {
+            float y = top - row * 40.f - 10.f;
+
+            auto saveBtn = CCMenuItemSpriteExtra::create(
+                ButtonSprite::create("Save"), this, menu_selector(HackMenu::onSaveReplay)
+            );
+            saveBtn->setPosition(ccp(90.f, y));
+            m_buttonMenu->addChild(saveBtn);
+            m_pageNodes.push_back(saveBtn);
+
+            auto loadBtn = CCMenuItemSpriteExtra::create(
+                ButtonSprite::create("Load"), this, menu_selector(HackMenu::onLoadReplay)
+            );
+            loadBtn->setPosition(ccp(210.f, y));
+            m_buttonMenu->addChild(loadBtn);
+            m_pageNodes.push_back(loadBtn);
+        }
+
         // The speed slider only shows on its own page
         if (m_page == SPEED_PAGE) {
             auto slider = Slider::create(this, menu_selector(HackMenu::onSpeedSlider), 0.8f);
@@ -241,6 +273,9 @@ protected:
         // The callback fires before the visual state flips, hence the "!"
         Mod::get()->setSavedValue<bool>(hack.id, !toggler->isToggled());
     }
+
+    void onSaveReplay(CCObject*) { saveReplayFile(); }
+    void onLoadReplay(CCObject*) { loadReplayFile(); }
 
     void onSpeedSlider(CCObject* sender) {
         float value = static_cast<SliderThumb*>(sender)->getValue();  // 0 to 1
@@ -411,6 +446,116 @@ static bool  g_hHeld         = false;
 static float g_holdTimer     = 0.f;
 static float g_repeatTimer   = 0.f;
 
+// ---- Replay Bot ----
+struct BotAction {
+    int frame;      // physics step the input happened on
+    bool down;      // press or release
+    int button;
+    bool player1;
+};
+
+static std::vector<BotAction> g_actions;
+static size_t g_playIndex = 0;   // next action to replay
+static int    g_frame = 0;       // physics steps since the attempt started
+static bool   g_injecting = false;
+static bool   g_resetting = false;
+static std::vector<int> g_checkpointFrames;  // frame each checkpoint was placed on
+
+static std::string replayKey(GJGameLevel* level) {
+    return "replay-" + std::string(level->m_levelName);
+}
+
+static std::string serializeActions() {
+    std::string out;
+    for (auto const& a : g_actions) {
+        out += fmt::format("{},{},{},{};", a.frame, a.down ? 1 : 0, a.button, a.player1 ? 1 : 0);
+    }
+    return out;
+}
+
+static void parseActions(std::string const& data) {
+    g_actions.clear();
+    std::istringstream stream(data);
+    std::string item;
+    while (std::getline(stream, item, ';')) {
+        std::istringstream line(item);
+        char c1, c2, c3;
+        int f, d, b, p;
+        if (line >> f >> c1 >> d >> c2 >> b >> c3 >> p) {
+            g_actions.push_back({f, d != 0, b, p != 0});
+        }
+    }
+}
+
+// ---- Frame fixes: player state saved at each practice-mode respawn ----
+struct PlayerFix {
+    int frame;
+    float x1, y1, rot1; double vy1;   // player 1
+    float x2, y2, rot2; double vy2;   // player 2
+};
+
+static std::vector<PlayerFix> g_fixes;
+static size_t g_fixIndex = 0;
+
+static std::string fixKey(GJGameLevel* level) {
+    return "replayfix-" + std::string(level->m_levelName);
+}
+
+static std::string serializeFixes() {
+    std::string out;
+    for (auto const& f : g_fixes) {
+        out += fmt::format("{},{},{},{},{},{},{},{},{};",
+            f.frame, f.x1, f.y1, f.rot1, f.vy1, f.x2, f.y2, f.rot2, f.vy2);
+    }
+    return out;
+}
+
+static void parseFixes(std::string const& data) {
+    g_fixes.clear();
+    std::istringstream stream(data);
+    std::string item;
+    while (std::getline(stream, item, ';')) {
+        std::istringstream line(item);
+        char c;
+        PlayerFix f{};
+        if (line >> f.frame >> c >> f.x1 >> c >> f.y1 >> c >> f.rot1 >> c >> f.vy1
+                 >> c >> f.x2 >> c >> f.y2 >> c >> f.rot2 >> c >> f.vy2) {
+            g_fixes.push_back(f);
+        }
+    }
+}
+
+static PlayerFix captureFix(PlayLayer* pl) {
+    PlayerFix f{};
+    f.frame = g_frame;
+    f.x1 = pl->m_player1->getPositionX();
+    f.y1 = pl->m_player1->getPositionY();
+    f.rot1 = pl->m_player1->getRotation();
+    f.vy1 = pl->m_player1->m_yVelocity;
+    f.x2 = pl->m_player2->getPositionX();
+    f.y2 = pl->m_player2->getPositionY();
+    f.rot2 = pl->m_player2->getRotation();
+    f.vy2 = pl->m_player2->m_yVelocity;
+    return f;
+}
+
+static void applyFix(PlayLayer* pl, PlayerFix const& f) {
+    auto p1 = pl->m_player1;
+    auto p2 = pl->m_player2;
+    if (!p1 || !p2) return;
+
+    // Shows how far the replay had drifted from the recording at this splice
+    log::info("Fix at frame {}: P1 was off by x={:.3f} y={:.3f} vy={:.3f}",
+        f.frame, p1->getPositionX() - f.x1, p1->getPositionY() - f.y1, p1->m_yVelocity - f.vy1);
+
+    p1->setPosition(ccp(f.x1, f.y1));
+    p1->setRotation(f.rot1);
+    p1->m_yVelocity = f.vy1;
+    p2->setPosition(ccp(f.x2, f.y2));
+    p2->setRotation(f.rot2);
+    p2->m_yVelocity = f.vy2;
+}
+
 class $modify(HackBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
         // Only freeze real levels, and only while the hack is on
@@ -441,13 +586,53 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        // Only count presses (not releases) inside a real level
-        if (down && static_cast<GJBaseGameLayer*>(this) == PlayLayer::get()) {
+        bool inLevel = static_cast<GJBaseGameLayer*>(this) == PlayLayer::get();
+
+        if (inLevel && g_resetting) {
+            log::info("Respawn button event: down={} button={} p1={} frame={}", down, button, isPlayer1, g_frame);
+        }
+
+        // CPS counter (counts injected clicks too)
+        if (inLevel && down) {
             auto now = std::chrono::steady_clock::now();
             g_clicks.push_back(now);
             g_lastClick = now;
         }
+
+        if (inLevel && !g_injecting) {
+            // The bot is driving: ignore real presses, but always let releases through
+            // so the game's own respawn releases can't leave a click stuck down
+            if (hackOn("bot-replay") && down) return;
+            if (hackOn("bot-record")) g_actions.push_back({g_frame, down, button, isPlayer1});
+        }
+
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (static_cast<GJBaseGameLayer*>(this) != PlayLayer::get()) {
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
+        }
+
+        auto pl = PlayLayer::get();
+            while (g_fixIndex < g_fixes.size() && g_fixes[g_fixIndex].frame <= g_frame) {
+                if (g_fixes[g_fixIndex].frame == g_frame) applyFix(pl, g_fixes[g_fixIndex]);
+                g_fixIndex++;
+            }
+
+        // Replay: fire every input that is due on this step
+        if (hackOn("bot-replay")) {
+            g_injecting = true;
+            while (g_playIndex < g_actions.size() && g_actions[g_playIndex].frame <= g_frame) {
+                auto const& a = g_actions[g_playIndex++];
+                this->handleButton(a.down, a.button, a.player1);
+            }
+            g_injecting = false;
+        }
+
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        g_frame++;
     }
 };
 
@@ -581,6 +766,96 @@ public:
     }
 };
 
+// ---- .violet replay files ----
+static std::string g_lastReplayName;  // level of the most recent recorded/loaded replay
+
+static std::string safeFileName(std::string name) {
+    for (auto& c : name) {
+        if (std::string("\\/:*?\"<>|").find(c) != std::string::npos) c = '_';
+    }
+    return name.empty() ? "replay" : name;
+}
+
+static void saveReplayFile() {
+    if (g_lastReplayName.empty()) {
+        Notification::create("Nothing to save yet: record and finish a level first",
+                             NotificationIcon::Warning)->show();
+        return;
+    }
+
+    auto name = g_lastReplayName;
+    auto actions = Mod::get()->getSavedValue<std::string>("replay-" + name, "");
+    auto fixes = Mod::get()->getSavedValue<std::string>("replayfix-" + name, "");
+    std::string text = fmt::format("violet-replay 1\nlevel={}\nactions={}\nfixes={}\n",
+                                   name, actions, fixes);
+
+    file::FilePickOptions options;
+    options.defaultPath = Mod::get()->getSaveDir() / (safeFileName(name) + ".violet");
+    options.filters.push_back({"Violet macro", {"*.violet"}});
+
+    async::spawn(file::pick(file::PickMode::SaveFile, options),
+        [text](geode::Result<std::optional<asp::fs::Path>> result) {
+        if (!result.isOk()) return;  // failed
+
+        auto picked = result.unwrap();
+        if (!picked) return;  // dialog cancelled
+
+        auto written = file::writeString(*picked, text);
+        if (written.isErr()) {
+            Notification::create("Couldn't write the file", NotificationIcon::Error)->show();
+        } else {
+            Notification::create("Replay saved", NotificationIcon::Success)->show();
+        }
+    });
+}
+
+static void loadReplayFile() {
+    file::FilePickOptions options;
+    options.defaultPath = Mod::get()->getSaveDir();
+    options.filters.push_back({"Violet macro", {"*.violet"}});
+
+    async::spawn(file::pick(file::PickMode::OpenFile, options),
+        [](geode::Result<std::optional<asp::fs::Path>> result) {
+        if (!result.isOk()) return;  // failed
+
+        auto picked = result.unwrap();
+        if (!picked) return;  // dialog cancelled
+
+        auto read = file::readString(*picked);
+        if (read.isErr()) {
+            Notification::create("Couldn't read the file", NotificationIcon::Error)->show();
+            return;
+        }
+
+        std::istringstream stream(read.unwrap());
+        std::string magic, line, name, actions, fixes;
+        std::getline(stream, magic);
+        if (magic.rfind("violet-replay", 0) != 0) {
+            Notification::create("Not a valid .violet file", NotificationIcon::Error)->show();
+            return;
+        }
+
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("level=", 0) == 0)        name = line.substr(6);
+            else if (line.rfind("actions=", 0) == 0) actions = line.substr(8);
+            else if (line.rfind("fixes=", 0) == 0)   fixes = line.substr(6);
+        }
+
+        if (name.empty() || actions.empty()) {
+            Notification::create("That file has no replay data", NotificationIcon::Error)->show();
+            return;
+        }
+
+        Mod::get()->setSavedValue<std::string>("replay-" + name, actions);
+        Mod::get()->setSavedValue<std::string>("replayfix-" + name, fixes);
+        g_lastReplayName = name;
+
+        Notification::create(fmt::format("Loaded replay for {}", name),
+                             NotificationIcon::Success)->show();
+    });
+}
+
 // ---- Noclip + Show Hitboxes ----
 class $modify(HackPlayLayer, PlayLayer) {
     struct Fields {
@@ -649,6 +924,13 @@ class $modify(HackPlayLayer, PlayLayer) {
     }
 
     void levelComplete() {
+        if (hackOn("bot-record") && !hackOn("bot-replay")) {
+            Mod::get()->setSavedValue<std::string>(replayKey(m_level), serializeActions());
+            Mod::get()->setSavedValue<std::string>(fixKey(m_level), serializeFixes());
+            g_lastReplayName = std::string(m_level->m_levelName);
+            log::info("Replay saved: {} inputs, {} frames", g_actions.size(), g_frame);
+        }
+
         bool safe = hackOn("safe-mode") ||
             (hackOn("auto-safe-mode") && (m_fields->badHackUsed || badHackActive()));
         g_safeCompletion = safe;
@@ -662,6 +944,12 @@ class $modify(HackPlayLayer, PlayLayer) {
             return;
         }
         PlayLayer::levelComplete();
+    }
+
+    CheckpointObject* createCheckpoint() {
+        auto cp = PlayLayer::createCheckpoint();
+        if (cp) g_checkpointFrames.push_back(g_frame);
+        return cp;
     }
 
     void updateStartPosUI() {
@@ -804,13 +1092,62 @@ class $modify(HackPlayLayer, PlayLayer) {
         if (auto overlay = FpsOverlay::create()) {
             m_uiLayer->addChild(overlay, 100);
         }
+
+        g_frame = 0;
+        g_checkpointFrames.clear();
+        g_playIndex = 0;
+        g_fixes.clear();
+        g_fixIndex = 0;
         return true;
     }
 
     void resetLevel() {
+        // Bot: decide where this attempt rewinds to BEFORE the game resets anything
+        int cpCount = m_checkpointArray ? m_checkpointArray->count() : 0;
+        bool fromCheckpoint = m_isPracticeMode && cpCount > 0 && !g_checkpointFrames.empty();
+
+        if (fromCheckpoint) {
+            if (g_checkpointFrames.size() > static_cast<size_t>(cpCount)) {
+                g_checkpointFrames.resize(cpCount);
+            }
+            g_frame = g_checkpointFrames.back();
+        } else {
+            g_frame = 0;
+            g_checkpointFrames.clear();
+        }
+
+        // Trim the recording now, so anything the game does during the reset
+        // (like releasing held buttons) gets recorded at the right frame
+        if (hackOn("bot-record") && !hackOn("bot-replay")) {
+            std::erase_if(g_actions, [](BotAction const& a) { return a.frame >= g_frame; });
+            std::erase_if(g_fixes, [](PlayerFix const& f) { return f.frame >= g_frame; });
+        }
+
+        g_resetting = true;
         PlayLayer::resetLevel();
+        g_resetting = false;
+
         m_fields->badHackUsed = false;
         g_badHackUsed = false;
+
+        if (hackOn("bot-replay")) {
+            parseActions(Mod::get()->getSavedValue<std::string>(replayKey(m_level), ""));
+            parseFixes(Mod::get()->getSavedValue<std::string>(fixKey(m_level), ""));
+            g_playIndex = 0;
+            while (g_playIndex < g_actions.size() && g_actions[g_playIndex].frame < g_frame) {
+                g_playIndex++;
+            }
+            g_fixIndex = 0;
+            while (g_fixIndex < g_fixes.size() && g_fixes[g_fixIndex].frame < g_frame) {
+                g_fixIndex++;
+            }
+        } else if (hackOn("bot-record") && fromCheckpoint) {
+            // Players are now at the restored checkpoint state, so capture them
+            g_fixes.push_back(captureFix(this));
+        }
+
+        log::info("Bot reset: practice={} checkpoints={} listed={} frame={}",
+                  m_isPracticeMode, cpCount, g_checkpointFrames.size(), g_frame);
     }
 };
 
