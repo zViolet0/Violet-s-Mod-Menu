@@ -1,5 +1,10 @@
 # Violet's Mod Menu Changelog
 
+## 1.1.1
+
+- Fixed the Safe-Mode text at the Level Complete Screen.
+- Fixed Show Hitboxes, again. (I hope it's not buggy anymore.)
+
 ## 1.1.0
 
 - Revamped the UI, so there's pages.

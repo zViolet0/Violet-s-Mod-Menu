@@ -307,6 +307,37 @@ static void drawQuad(CCDrawNode* node, CCPoint a, CCPoint b, CCPoint c, CCPoint 
     node->drawPolygon(verts, 4, ccColor4F{0.f, 0.f, 0.f, 0.f}, 0.5f, border);
 }
 
+static void drawSlope(CCDrawNode* node, GameObject* obj, ccColor4F border) {
+    auto rect = obj->getObjectRect();
+    CCPoint center = ccp(rect.getMidX(), rect.getMidY());
+
+    float rotation = obj->getRotation();
+    float w = rect.size.width;
+    float h = rect.size.height;
+
+    // At 90/270 degrees the rect is already swapped, so swap back to get the unrotated size
+    if (std::fmod(std::abs(rotation), 180.f) > 45.f) std::swap(w, h);
+
+    // Unrotated slope: right angle at the bottom-right corner
+    CCPoint local[3] = {
+        ccp(-w / 2.f, -h / 2.f),
+        ccp( w / 2.f, -h / 2.f),
+        ccp( w / 2.f,  h / 2.f),
+    };
+
+    float rad = rotation * static_cast<float>(M_PI) / 180.f;
+    float c = std::cos(rad), s = std::sin(rad);
+
+    CCPoint verts[3];
+    for (int i = 0; i < 3; i++) {
+        float x = local[i].x * (obj->isFlipX() ? -1.f : 1.f);
+        float y = local[i].y * (obj->isFlipY() ? -1.f : 1.f);
+        // cocos rotation is clockwise
+        verts[i] = ccp(center.x + x * c + y * s, center.y - x * s + y * c);
+    }
+    node->drawPolygon(verts, 3, ccColor4F{0.f, 0.f, 0.f, 0.f}, 0.5f, border);
+}
+
 // ---- StartPos Switcher ----
 static std::vector<StartPosObject*> getStartPositions(PlayLayer* pl) {
     std::vector<StartPosObject*> list;
@@ -724,6 +755,7 @@ class $modify(HackPlayLayer, PlayLayer) {
 
         for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
             if (!obj) continue;
+            if (obj->m_isGroupDisabled) continue;
 
             auto type = obj->m_objectType;
             if (type == GameObjectType::Decoration) continue;
@@ -734,6 +766,11 @@ class $modify(HackPlayLayer, PlayLayer) {
             ccColor4F color = interactColor;
             if (type == GameObjectType::Hazard) color = hazardColor;
             else if (type == GameObjectType::Solid) color = solidColor;
+
+            if (type == GameObjectType::Slope) {
+                drawSlope(node, obj, solidColor);
+                continue;
+            }
 
             if (obj->m_objectRadius > 0.f) {
                 // Round object (saw, orb, etc.)
@@ -868,7 +905,7 @@ class $modify(HackEndLevelLayer, EndLevelLayer) {
 
             auto label = CCLabelBMFont::create("safe mode bro", "bigFont.fnt");
             label->setScale(0.4f);
-            label->setPosition(ccp(winSize.width / 2.f, winSize.height / 2.f - 75.f));
+            label->setPosition(ccp(winSize.width / 2.f, winSize.height / 2.f - 95.f));
             m_mainLayer->addChild(label);
         }
     }
