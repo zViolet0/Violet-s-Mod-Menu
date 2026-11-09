@@ -1,5 +1,11 @@
 # Violet's Mod Menu Changelog
 
+## 2.1.0
+
+- Added a lot more information to each replay file.
+- Added Bot Editor!
+- Bug fixes!
+
 ## 2.0.0
 
 - Added a  **Replay Bot**!

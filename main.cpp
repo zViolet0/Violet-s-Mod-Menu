@@ -21,6 +21,7 @@
 #include <deque>
 #include <sstream>
 #include <cstdio>
+#include <numeric>
 
 
 using namespace geode::prelude;
@@ -94,6 +95,60 @@ static bool rollJumpscare() {
 static std::deque<std::chrono::steady_clock::time_point> g_clicks;
 static std::chrono::steady_clock::time_point g_lastClick = std::chrono::steady_clock::time_point{};
 
+static void countClick() {
+    auto now = std::chrono::steady_clock::now();
+    g_clicks.push_back(now);
+    g_lastClick = now;
+}
+
+// ---- Replay info: used to warn about mismatches ----
+struct ReplayMeta {
+    std::string tps = "0";
+    std::string version;
+};
+
+static float g_stepDt = 0.f;        // physics step size, as seen by processCommands
+static bool  g_metaChecked = false; // already compared this level's replay info
+
+static std::string formatMeta(ReplayMeta const& m) {
+    return fmt::format("{}|{}", m.tps, m.version);
+}
+
+static ReplayMeta parseMeta(std::string const& s) {
+    ReplayMeta m;
+    if (s.empty()) return m;
+    std::istringstream stream(s);
+    std::getline(stream, m.tps, '|');
+    std::getline(stream, m.version, '|');
+    return m;
+}
+
+static int currentTps() {
+    return g_stepDt > 0.f ? static_cast<int>(1.0 / g_stepDt + 0.5) : 0;
+}
+
+// Compares the loaded replay's info with the current setup, once per level
+static void checkReplayMeta(PlayLayer* pl) {
+    if (g_metaChecked || g_stepDt <= 0.f || !pl || !pl->m_level) return;
+    g_metaChecked = true;
+
+    auto meta = parseMeta(Mod::get()->getSavedValue<std::string>(
+        "replaymeta-" + std::string(pl->m_level->m_levelName), ""));
+
+    int savedTps = std::atoi(meta.tps.c_str());
+
+    std::string warning;
+    if (savedTps > 0 && std::abs(savedTps - currentTps()) > 1) {
+        warning += fmt::format("TPS differs: replay was {}, now {}. ", savedTps, currentTps());
+    }
+    if (!meta.version.empty() && meta.version != Mod::get()->getVersion().toVString()) {
+        warning += fmt::format("Recorded on mod version {}. ", meta.version);
+    }
+    if (!warning.empty()) {
+        Notification::create(warning, NotificationIcon::Warning, 6.f)->show();
+    }
+}
+
 static float getSpeed() {
     return Mod::get()->getSavedValue<float>("speedhack-value", 1.0f);
 }
@@ -145,6 +200,8 @@ constexpr int BOT_PAGE = 4;  // index of "Bot" in PAGE_NAMES
 
 static void saveReplayFile();
 static void loadReplayFile();
+
+static void openBotEditor();
 
 // ---- The popup ----
 class HackMenu : public geode::Popup {
@@ -237,6 +294,13 @@ protected:
             loadBtn->setPosition(ccp(210.f, y));
             m_buttonMenu->addChild(loadBtn);
             m_pageNodes.push_back(loadBtn);
+
+            auto editBtn = CCMenuItemSpriteExtra::create(
+                ButtonSprite::create("Bot Editor"), this, menu_selector(HackMenu::onBotEditor)
+            );
+            editBtn->setPosition(ccp(150.f, y - 40.f));
+            m_buttonMenu->addChild(editBtn);
+            m_pageNodes.push_back(editBtn);
         }
 
         // The speed slider only shows on its own page
@@ -276,6 +340,7 @@ protected:
 
     void onSaveReplay(CCObject*) { saveReplayFile(); }
     void onLoadReplay(CCObject*) { loadReplayFile(); }
+    void onBotEditor(CCObject*) { openBotEditor(); }
 
     void onSpeedSlider(CCObject* sender) {
         float value = static_cast<SliderThumb*>(sender)->getValue();  // 0 to 1
@@ -588,20 +653,11 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         bool inLevel = static_cast<GJBaseGameLayer*>(this) == PlayLayer::get();
 
-        if (inLevel && g_resetting) {
-            log::info("Respawn button event: down={} button={} p1={} frame={}", down, button, isPlayer1, g_frame);
-        }
-
-        // CPS counter (counts injected clicks too)
-        if (inLevel && down) {
-            auto now = std::chrono::steady_clock::now();
-            g_clicks.push_back(now);
-            g_lastClick = now;
-        }
+        // CPS: while replaying, clicks are counted where the bot fires them (in processCommands)
+        if (inLevel && down && !hackOn("bot-replay")) countClick();
 
         if (inLevel && !g_injecting) {
             // The bot is driving: ignore real presses, but always let releases through
-            // so the game's own respawn releases can't leave a click stuck down
             if (hackOn("bot-replay") && down) return;
             if (hackOn("bot-record")) g_actions.push_back({g_frame, down, button, isPlayer1});
         }
@@ -610,6 +666,7 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        g_stepDt = dt;
         if (static_cast<GJBaseGameLayer*>(this) != PlayLayer::get()) {
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
@@ -621,11 +678,14 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
                 g_fixIndex++;
             }
 
+        checkReplayMeta(pl);
+
         // Replay: fire every input that is due on this step
         if (hackOn("bot-replay")) {
             g_injecting = true;
             while (g_playIndex < g_actions.size() && g_actions[g_playIndex].frame <= g_frame) {
                 auto const& a = g_actions[g_playIndex++];
+                if (a.down) countClick();
                 this->handleButton(a.down, a.button, a.player1);
             }
             g_injecting = false;
@@ -786,8 +846,11 @@ static void saveReplayFile() {
     auto name = g_lastReplayName;
     auto actions = Mod::get()->getSavedValue<std::string>("replay-" + name, "");
     auto fixes = Mod::get()->getSavedValue<std::string>("replayfix-" + name, "");
-    std::string text = fmt::format("violet-replay 1\nlevel={}\nactions={}\nfixes={}\n",
-                                   name, actions, fixes);
+    auto meta = parseMeta(Mod::get()->getSavedValue<std::string>("replaymeta-" + name, ""));
+
+    std::string text = fmt::format(
+        "violet-replay 2\nlevel={}\ntps={}\nversion={}\nactions={}\nfixes={}\n",
+        name, meta.tps, meta.version, actions, fixes);
 
     file::FilePickOptions options;
     options.defaultPath = Mod::get()->getSaveDir() / (safeFileName(name) + ".violet");
@@ -829,6 +892,9 @@ static void loadReplayFile() {
 
         std::istringstream stream(read.unwrap());
         std::string magic, line, name, actions, fixes;
+        ReplayMeta meta;
+        bool hasMeta = false;
+
         std::getline(stream, magic);
         if (magic.rfind("violet-replay", 0) != 0) {
             Notification::create("Not a valid .violet file", NotificationIcon::Error)->show();
@@ -837,9 +903,11 @@ static void loadReplayFile() {
 
         while (std::getline(stream, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.rfind("level=", 0) == 0)        name = line.substr(6);
-            else if (line.rfind("actions=", 0) == 0) actions = line.substr(8);
-            else if (line.rfind("fixes=", 0) == 0)   fixes = line.substr(6);
+            if (line.rfind("level=", 0) == 0)         name = line.substr(6);
+            else if (line.rfind("tps=", 0) == 0)      { meta.tps = line.substr(4); hasMeta = true; }
+            else if (line.rfind("version=", 0) == 0)  { meta.version = line.substr(8); hasMeta = true; }
+            else if (line.rfind("actions=", 0) == 0)  actions = line.substr(8);
+            else if (line.rfind("fixes=", 0) == 0)    fixes = line.substr(6);
         }
 
         if (name.empty() || actions.empty()) {
@@ -849,11 +917,263 @@ static void loadReplayFile() {
 
         Mod::get()->setSavedValue<std::string>("replay-" + name, actions);
         Mod::get()->setSavedValue<std::string>("replayfix-" + name, fixes);
+        // Older files have no info, so clear any stale info stored under this name
+        Mod::get()->setSavedValue<std::string>("replaymeta-" + name, hasMeta ? formatMeta(meta) : "");
         g_lastReplayName = name;
 
-        Notification::create(fmt::format("Loaded replay for {}", name),
-                             NotificationIcon::Success)->show();
+        std::string note = fmt::format("Loaded replay for {}", name);
+        if (hasMeta && meta.tps != "0") note += fmt::format(" ({} TPS)", meta.tps);
+        Notification::create(note, NotificationIcon::Success)->show();
     });
+}
+
+// ---- Bot Editor ----
+static std::vector<BotAction> readActions(std::string const& data) {
+    std::vector<BotAction> out;
+    std::istringstream stream(data);
+    std::string item;
+    while (std::getline(stream, item, ';')) {
+        std::istringstream line(item);
+        char c1, c2, c3;
+        int f, d, b, p;
+        if (line >> f >> c1 >> d >> c2 >> b >> c3 >> p) {
+            out.push_back({f, d != 0, b, p != 0});
+        }
+    }
+    return out;
+}
+
+static std::string writeActions(std::vector<BotAction> const& actions) {
+    std::string out;
+    for (auto const& a : actions) {
+        out += fmt::format("{},{},{},{};", a.frame, a.down ? 1 : 0, a.button, a.player1 ? 1 : 0);
+    }
+    return out;
+}
+
+class BotEditor : public geode::Popup {
+protected:
+    std::string m_name;
+    std::vector<BotAction> m_actions;
+    int m_selected = -1;
+    ScrollLayer* m_scroll = nullptr;
+    CCLabelBMFont* m_info = nullptr;
+    CCLabelBMFont* m_frameLabel = nullptr;
+
+    static constexpr float LIST_W = 250.f;
+    static constexpr float LIST_H = 150.f;
+    static constexpr float ROW_H  = 22.f;
+
+    bool init(std::string const& name, std::vector<BotAction> const& actions) {
+        if (!Popup::init(300.f, 310.f)) return false;
+
+        m_name = name;
+        m_actions = actions;
+        m_selected = m_actions.empty() ? -1 : 0;
+
+        this->setTitle("Bot Editor");
+
+        m_info = CCLabelBMFont::create("", "goldFont.fnt");
+        m_info->setScale(0.45f);
+        m_mainLayer->addChildAtPosition(m_info, Anchor::Top, ccp(0.f, -40.f));
+
+        m_scroll = ScrollLayer::create(CCSize{LIST_W, LIST_H});
+        m_scroll->setPosition(ccp((m_size.width - LIST_W) / 2.f, 95.f));
+        m_mainLayer->addChild(m_scroll);
+
+        // Shows the selected input's frame, between the - and + buttons
+        m_frameLabel = CCLabelBMFont::create("", "bigFont.fnt");
+        m_frameLabel->setScale(0.4f);
+        m_frameLabel->setPosition(ccp(150.f, 70.f));
+        m_buttonMenu->addChild(m_frameLabel);
+
+        // The tag carries the frame step for the +/- buttons
+        auto addBtn = [&](char const* text, SEL_MenuHandler handler, float x, float y, int tag) {
+            auto spr = ButtonSprite::create(text);
+            spr->setScale(0.55f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, handler);
+            btn->setTag(tag);
+            btn->setPosition(ccp(x, y));
+            m_buttonMenu->addChild(btn);
+        };
+        addBtn("-10", menu_selector(BotEditor::onFrameStep), 40.f,  70.f, -10);
+        addBtn("-1",  menu_selector(BotEditor::onFrameStep), 85.f,  70.f, -1);
+        addBtn("+1",  menu_selector(BotEditor::onFrameStep), 215.f, 70.f, 1);
+        addBtn("+10", menu_selector(BotEditor::onFrameStep), 260.f, 70.f, 10);
+
+        addBtn("Toggle", menu_selector(BotEditor::onToggleType), 70.f,  32.f, 0);
+        addBtn("Add",    menu_selector(BotEditor::onAdd),        150.f, 32.f, 0);
+        addBtn("Remove", menu_selector(BotEditor::onRemove),     230.f, 32.f, 0);
+
+        this->buildList();
+        m_scroll->moveToTop();
+        this->updateFrameLabel();
+        return true;
+    }
+
+    void updateFrameLabel() {
+        if (m_selected >= 0 && m_selected < static_cast<int>(m_actions.size())) {
+            m_frameLabel->setString(fmt::format("Frame {}", m_actions[m_selected].frame).c_str());
+        } else {
+            m_frameLabel->setString("No input");
+        }
+    }
+
+    // Rebuilds every row from m_actions
+    void buildList() {
+        m_info->setString(fmt::format("{} - {} inputs", m_name, m_actions.size()).c_str());
+
+        auto content = m_scroll->m_contentLayer;
+        content->removeAllChildren();
+
+        float height = std::max(LIST_H, m_actions.size() * ROW_H + 10.f);
+        content->setContentSize(CCSize{LIST_W, height});
+
+        auto menu = CCMenu::create();
+        menu->setPosition(ccp(0.f, 0.f));
+        content->addChild(menu, 1);
+
+        for (size_t i = 0; i < m_actions.size(); i++) {
+            auto const& a = m_actions[i];
+            float y = height - 16.f - i * ROW_H;
+            bool selected = static_cast<int>(i) == m_selected;
+
+            if (selected) {
+                auto highlight = CCLayerColor::create(
+                    ccColor4B{255, 255, 255, 45}, LIST_W - 8.f, ROW_H - 2.f);
+                highlight->setPosition(ccp(4.f, y - (ROW_H - 2.f) / 2.f));
+                content->addChild(highlight, 0);
+            }
+
+            auto label = CCLabelBMFont::create(
+                fmt::format("{} at Frame {}", a.down ? "Click" : "Release", a.frame).c_str(),
+                "bigFont.fnt");
+            label->setScale(0.4f);
+            if (selected)        label->setColor(ccColor3B{255, 215, 0});    // selected: gold
+            else if (!a.down)    label->setColor(ccColor3B{170, 170, 170});  // releases: grey
+
+            auto btn = CCMenuItemSpriteExtra::create(label, this, menu_selector(BotEditor::onSelect));
+            btn->setTag(static_cast<int>(i));
+            btn->setPosition(ccp(LIST_W / 2.f, y));
+            menu->addChild(btn);
+        }
+
+        // Makes the row buttons receive touches inside the popup
+        handleTouchPriority(this);
+    }
+
+    // Keeps the selected row in view (centered when possible)
+    void scrollToSelected() {
+        if (m_selected < 0) return;
+        auto content = m_scroll->m_contentLayer;
+        float height = content->getContentSize().height;
+        float rowY = height - 16.f - m_selected * ROW_H;
+        float y = std::clamp(LIST_H / 2.f - rowY, LIST_H - height, 0.f);
+        content->setPositionY(y);
+    }
+
+    void rebuild(bool center) {
+        auto content = m_scroll->m_contentLayer;
+        float oldY = content->getPositionY();
+
+        this->buildList();
+
+        if (center) {
+            this->scrollToSelected();
+        } else {
+            float height = content->getContentSize().height;
+            content->setPositionY(std::clamp(oldY, LIST_H - height, 0.f));
+        }
+        this->updateFrameLabel();
+    }
+
+    // Sorts by frame (stable, so equal frames keep their order), keeps the
+    // selection on the same input, and saves the macro
+    void commit() {
+        std::vector<size_t> order(m_actions.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return m_actions[a].frame < m_actions[b].frame;
+        });
+
+        std::vector<BotAction> sorted;
+        sorted.reserve(m_actions.size());
+        int newSelected = -1;
+        for (size_t i = 0; i < order.size(); i++) {
+            sorted.push_back(m_actions[order[i]]);
+            if (static_cast<int>(order[i]) == m_selected) newSelected = static_cast<int>(i);
+        }
+        m_actions = std::move(sorted);
+        m_selected = newSelected;
+
+        Mod::get()->setSavedValue<std::string>("replay-" + m_name, writeActions(m_actions));
+    }
+
+    void onSelect(CCObject* sender) {
+        m_selected = static_cast<CCNode*>(sender)->getTag();
+        this->rebuild(false);
+    }
+
+    void onFrameStep(CCObject* sender) {
+        if (m_selected < 0) return;
+        int delta = static_cast<CCNode*>(sender)->getTag();
+        m_actions[m_selected].frame = std::max(0, m_actions[m_selected].frame + delta);
+        this->commit();
+        this->rebuild(true);
+    }
+
+    void onToggleType(CCObject*) {
+        if (m_selected < 0) return;
+        m_actions[m_selected].down = !m_actions[m_selected].down;
+        this->commit();
+        this->rebuild(true);
+    }
+
+    void onAdd(CCObject*) {
+        // A new click one frame after the selected input (or at frame 0 if the list is empty)
+        int frame = m_selected >= 0 ? m_actions[m_selected].frame + 1 : 0;
+        m_actions.push_back({frame, true, 1, false});
+        m_selected = static_cast<int>(m_actions.size()) - 1;
+        this->commit();
+        this->rebuild(true);
+    }
+
+    void onRemove(CCObject*) {
+        if (m_selected < 0) return;
+        m_actions.erase(m_actions.begin() + m_selected);
+        m_selected = m_actions.empty()
+            ? -1
+            : std::min(m_selected, static_cast<int>(m_actions.size()) - 1);
+        this->commit();
+        this->rebuild(true);
+    }
+
+public:
+    static BotEditor* create(std::string const& name, std::vector<BotAction> const& actions) {
+        auto ret = new BotEditor();
+        if (ret->init(name, actions)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+static void openBotEditor() {
+    if (g_lastReplayName.empty()) {
+        Notification::create("Load or record a macro first", NotificationIcon::Warning)->show();
+        return;
+    }
+
+    auto actions = readActions(
+        Mod::get()->getSavedValue<std::string>("replay-" + g_lastReplayName, ""));
+    if (actions.empty()) {
+        Notification::create("That macro has no inputs", NotificationIcon::Warning)->show();
+        return;
+    }
+
+    if (auto popup = BotEditor::create(g_lastReplayName, actions)) popup->show();
 }
 
 // ---- Noclip + Show Hitboxes ----
@@ -928,6 +1248,12 @@ class $modify(HackPlayLayer, PlayLayer) {
             Mod::get()->setSavedValue<std::string>(replayKey(m_level), serializeActions());
             Mod::get()->setSavedValue<std::string>(fixKey(m_level), serializeFixes());
             g_lastReplayName = std::string(m_level->m_levelName);
+            ReplayMeta meta;
+            meta.tps = std::to_string(currentTps());
+            meta.version = Mod::get()->getVersion().toVString();
+            Mod::get()->setSavedValue<std::string>(
+                "replaymeta-" + std::string(m_level->m_levelName), formatMeta(meta));
+            log::info("Replay info: tps={} version={}", meta.tps, meta.version);
             log::info("Replay saved: {} inputs, {} frames", g_actions.size(), g_frame);
         }
 
@@ -1098,6 +1424,7 @@ class $modify(HackPlayLayer, PlayLayer) {
         g_playIndex = 0;
         g_fixes.clear();
         g_fixIndex = 0;
+        g_metaChecked = false;
         return true;
     }
 

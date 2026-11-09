@@ -4,7 +4,9 @@ A simple  *personalized*  mod menu, made for  **zViolet0**.
 
 Contains all the essentials, like  **Noclip**,  **Speedhack**, etc.
 
-This mod is not publicly available. This mod is only available to whom I trust, and can hold this mod without sharing it without my permission.
+~~This mod is not publicly available. This mod is only available to whom I trust, and can hold this mod without sharing it without my permission.~~
+
+It's public now! Hooray!
 
 ## How to use
 
