@@ -158,15 +158,8 @@ static bool g_badHackUsed = false;
 
 // Hacks that make a run unsafe. Edit this list freely.
 static bool badHackActive() {
-    if (hackOn("noclip") || hackOn("show-hitboxes") || hackOn("frame-advance") ||
-        hackOn("speedhack") || hackOn("instant-complete") || hackOn("bot-replay")) return true;
-
-    // StartPos Switcher only counts while you're on a startpos (not "0")
-    if (hackOn("startpos-switcher")) {
-        auto pl = PlayLayer::get();
-        if (pl && pl->m_startPosObject) return true;
-    }
-    return false;
+    return hackOn("noclip") || hackOn("show-hitboxes") || hackOn("frame-advance") ||
+           hackOn("speedhack") || hackOn("instant-complete") || hackOn("bot-replay");
 }
 
 // Sets the music playback speed to match the game speed
@@ -621,6 +614,10 @@ static void applyFix(PlayLayer* pl, PlayerFix const& f) {
     p2->m_yVelocity = f.vy2;
 }
 
+static bool isTwoPlayerLevel(PlayLayer* pl) {
+    return pl && pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode;
+}
+
 class $modify(HackBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
         // Only freeze real levels, and only while the hack is on
@@ -659,7 +656,13 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
         if (inLevel && !g_injecting) {
             // The bot is driving: ignore real presses, but always let releases through
             if (hackOn("bot-replay") && down) return;
-            if (hackOn("bot-record")) g_actions.push_back({g_frame, down, button, isPlayer1});
+            if (hackOn("bot-record")) {
+                // The third parameter is really "player 2". In single-player levels it only
+                // shows up as respawn noise, so only record it when the level is two-player.
+                if (isTwoPlayerLevel(PlayLayer::get()) || !isPlayer1) {
+                    g_actions.push_back({g_frame, down, button, isPlayer1});
+                }
+            }
         }
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
@@ -848,9 +851,10 @@ static void saveReplayFile() {
     auto fixes = Mod::get()->getSavedValue<std::string>("replayfix-" + name, "");
     auto meta = parseMeta(Mod::get()->getSavedValue<std::string>("replaymeta-" + name, ""));
 
+    bool twoPlayer = Mod::get()->getSavedValue<bool>("replay2p-" + name, false);
     std::string text = fmt::format(
-        "violet-replay 2\nlevel={}\ntps={}\nversion={}\nactions={}\nfixes={}\n",
-        name, meta.tps, meta.version, actions, fixes);
+        "violet-replay 2\nlevel={}\ntps={}\nversion={}\ntwoplayer={}\nactions={}\nfixes={}\n",
+        name, meta.tps, meta.version, twoPlayer ? 1 : 0, actions, fixes);
 
     file::FilePickOptions options;
     options.defaultPath = Mod::get()->getSaveDir() / (safeFileName(name) + ".violet");
@@ -894,6 +898,7 @@ static void loadReplayFile() {
         std::string magic, line, name, actions, fixes;
         ReplayMeta meta;
         bool hasMeta = false;
+        bool twoPlayer = false;
 
         std::getline(stream, magic);
         if (magic.rfind("violet-replay", 0) != 0) {
@@ -908,6 +913,7 @@ static void loadReplayFile() {
             else if (line.rfind("version=", 0) == 0)  { meta.version = line.substr(8); hasMeta = true; }
             else if (line.rfind("actions=", 0) == 0)  actions = line.substr(8);
             else if (line.rfind("fixes=", 0) == 0)    fixes = line.substr(6);
+            else if (line.rfind("twoplayer=", 0) == 0) twoPlayer = line.substr(10) == "1";
         }
 
         if (name.empty() || actions.empty()) {
@@ -919,6 +925,7 @@ static void loadReplayFile() {
         Mod::get()->setSavedValue<std::string>("replayfix-" + name, fixes);
         // Older files have no info, so clear any stale info stored under this name
         Mod::get()->setSavedValue<std::string>("replaymeta-" + name, hasMeta ? formatMeta(meta) : "");
+        Mod::get()->setSavedValue<bool>("replay2p-" + name, twoPlayer);
         g_lastReplayName = name;
 
         std::string note = fmt::format("Loaded replay for {}", name);
@@ -955,6 +962,7 @@ class BotEditor : public geode::Popup {
 protected:
     std::string m_name;
     std::vector<BotAction> m_actions;
+    bool m_twoPlayer = false;
     int m_selected = -1;
     ScrollLayer* m_scroll = nullptr;
     CCLabelBMFont* m_info = nullptr;
@@ -964,11 +972,12 @@ protected:
     static constexpr float LIST_H = 150.f;
     static constexpr float ROW_H  = 22.f;
 
-    bool init(std::string const& name, std::vector<BotAction> const& actions) {
+    bool init(std::string const& name, std::vector<BotAction> const& actions, bool twoPlayer) {
         if (!Popup::init(300.f, 310.f)) return false;
 
         m_name = name;
         m_actions = actions;
+        m_twoPlayer = twoPlayer;
         m_selected = m_actions.empty() ? -1 : 0;
 
         this->setTitle("Bot Editor");
@@ -981,29 +990,38 @@ protected:
         m_scroll->setPosition(ccp((m_size.width - LIST_W) / 2.f, 95.f));
         m_mainLayer->addChild(m_scroll);
 
-        // Shows the selected input's frame, between the - and + buttons
         m_frameLabel = CCLabelBMFont::create("", "bigFont.fnt");
         m_frameLabel->setScale(0.4f);
         m_frameLabel->setPosition(ccp(150.f, 70.f));
         m_buttonMenu->addChild(m_frameLabel);
 
         // The tag carries the frame step for the +/- buttons
-        auto addBtn = [&](char const* text, SEL_MenuHandler handler, float x, float y, int tag) {
+        auto addBtn = [&](char const* text, SEL_MenuHandler handler, float x, float y, int tag, float scale) {
             auto spr = ButtonSprite::create(text);
-            spr->setScale(0.55f);
+            spr->setScale(scale);
             auto btn = CCMenuItemSpriteExtra::create(spr, this, handler);
             btn->setTag(tag);
             btn->setPosition(ccp(x, y));
             m_buttonMenu->addChild(btn);
         };
-        addBtn("-10", menu_selector(BotEditor::onFrameStep), 40.f,  70.f, -10);
-        addBtn("-1",  menu_selector(BotEditor::onFrameStep), 85.f,  70.f, -1);
-        addBtn("+1",  menu_selector(BotEditor::onFrameStep), 215.f, 70.f, 1);
-        addBtn("+10", menu_selector(BotEditor::onFrameStep), 260.f, 70.f, 10);
+        addBtn("-10", menu_selector(BotEditor::onFrameStep), 40.f,  70.f, -10, 0.55f);
+        addBtn("-1",  menu_selector(BotEditor::onFrameStep), 85.f,  70.f, -1,  0.55f);
+        addBtn("+1",  menu_selector(BotEditor::onFrameStep), 215.f, 70.f, 1,   0.55f);
+        addBtn("+10", menu_selector(BotEditor::onFrameStep), 260.f, 70.f, 10,  0.55f);
 
-        addBtn("Toggle", menu_selector(BotEditor::onToggleType), 70.f,  32.f, 0);
-        addBtn("Add",    menu_selector(BotEditor::onAdd),        150.f, 32.f, 0);
-        addBtn("Remove", menu_selector(BotEditor::onRemove),     230.f, 32.f, 0);
+        // Bottom row: spaced evenly, with an extra P1/P2 button in two-player macros
+        struct Entry { char const* text; SEL_MenuHandler handler; };
+        std::vector<Entry> row;
+        row.push_back({"Toggle", menu_selector(BotEditor::onToggleType)});
+        if (m_twoPlayer) row.push_back({"P1/P2", menu_selector(BotEditor::onTogglePlayer)});
+        row.push_back({"Add",    menu_selector(BotEditor::onAdd)});
+        row.push_back({"Remove", menu_selector(BotEditor::onRemove)});
+
+        float scale = row.size() > 3 ? 0.5f : 0.55f;
+        for (size_t i = 0; i < row.size(); i++) {
+            float x = 20.f + 260.f * (static_cast<float>(i) + 0.5f) / static_cast<float>(row.size());
+            addBtn(row[i].text, row[i].handler, x, 32.f, 0, scale);
+        }
 
         this->buildList();
         m_scroll->moveToTop();
@@ -1045,8 +1063,10 @@ protected:
                 content->addChild(highlight, 0);
             }
 
+            // The flag is true for player 2 (swap these two strings if your labels come out reversed)
+            std::string who = m_twoPlayer ? (a.player1 ? "P1 " : "P2 ") : "";
             auto label = CCLabelBMFont::create(
-                fmt::format("{} at Frame {}", a.down ? "Click" : "Release", a.frame).c_str(),
+                fmt::format("{}{} at Frame {}", who, a.down ? "Click" : "Release", a.frame).c_str(),
                 "bigFont.fnt");
             label->setScale(0.4f);
             if (selected)        label->setColor(ccColor3B{255, 215, 0});    // selected: gold
@@ -1058,11 +1078,9 @@ protected:
             menu->addChild(btn);
         }
 
-        // Makes the row buttons receive touches inside the popup
         handleTouchPriority(this);
     }
 
-    // Keeps the selected row in view (centered when possible)
     void scrollToSelected() {
         if (m_selected < 0) return;
         auto content = m_scroll->m_contentLayer;
@@ -1129,10 +1147,18 @@ protected:
         this->rebuild(true);
     }
 
+    void onTogglePlayer(CCObject*) {
+        if (m_selected < 0) return;
+        m_actions[m_selected].player1 = !m_actions[m_selected].player1;
+        this->commit();
+        this->rebuild(true);
+    }
+
     void onAdd(CCObject*) {
-        // A new click one frame after the selected input (or at frame 0 if the list is empty)
+        // A new click one frame after the selected input, for the same player
         int frame = m_selected >= 0 ? m_actions[m_selected].frame + 1 : 0;
-        m_actions.push_back({frame, true, 1, false});
+        bool player = m_selected >= 0 ? m_actions[m_selected].player1 : false;
+        m_actions.push_back({frame, true, 1, player});
         m_selected = static_cast<int>(m_actions.size()) - 1;
         this->commit();
         this->rebuild(true);
@@ -1149,9 +1175,9 @@ protected:
     }
 
 public:
-    static BotEditor* create(std::string const& name, std::vector<BotAction> const& actions) {
+    static BotEditor* create(std::string const& name, std::vector<BotAction> const& actions, bool twoPlayer) {
         auto ret = new BotEditor();
-        if (ret->init(name, actions)) {
+        if (ret->init(name, actions, twoPlayer)) {
             ret->autorelease();
             return ret;
         }
@@ -1173,7 +1199,8 @@ static void openBotEditor() {
         return;
     }
 
-    if (auto popup = BotEditor::create(g_lastReplayName, actions)) popup->show();
+    bool twoPlayer = Mod::get()->getSavedValue<bool>("replay2p-" + g_lastReplayName, false);
+    if (auto popup = BotEditor::create(g_lastReplayName, actions, twoPlayer)) popup->show();
 }
 
 // ---- Noclip + Show Hitboxes ----
@@ -1253,11 +1280,16 @@ class $modify(HackPlayLayer, PlayLayer) {
             meta.version = Mod::get()->getVersion().toVString();
             Mod::get()->setSavedValue<std::string>(
                 "replaymeta-" + std::string(m_level->m_levelName), formatMeta(meta));
+            Mod::get()->setSavedValue<bool>("replay2p-" + std::string(m_level->m_levelName),
+                                            isTwoPlayerLevel(this));
             log::info("Replay info: tps={} version={}", meta.tps, meta.version);
             log::info("Replay saved: {} inputs, {} frames", g_actions.size(), g_frame);
         }
 
-        bool safe = hackOn("safe-mode") ||
+        // A run from a startpos (not position 0) never counts, like a real startpos run
+        bool onStartPos = hackOn("startpos-switcher") && m_startPosObject != nullptr;
+
+        bool safe = hackOn("safe-mode") || onStartPos ||
             (hackOn("auto-safe-mode") && (m_fields->badHackUsed || badHackActive()));
         g_safeCompletion = safe;
 

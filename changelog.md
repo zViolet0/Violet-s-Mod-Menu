@@ -1,5 +1,11 @@
 # Violet's Mod Menu Changelog
 
+## 2.2.0
+
+- Made 2 Player actually works with the Replay Bot!
+- Added more to the Bot Editor.
+- Bug fixes!
+
 ## 2.1.0
 
 - Added a lot more information to each replay file.
