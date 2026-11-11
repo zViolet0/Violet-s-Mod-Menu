@@ -700,6 +700,7 @@ class $modify(HackBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---- Opening the menu with TAB ----
+#ifdef GEODE_IS_DESKTOP
 class $modify(HackKeyDispatcher, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat, double timestamp) {
         if (down && !repeat && key == KEY_Tab) {
@@ -728,6 +729,125 @@ class $modify(HackKeyDispatcher, CCKeyboardDispatcher) {
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat, timestamp);
     }
 };
+#endif
+
+#ifdef GEODE_IS_MOBILE
+#include <Geode/ui/OverlayManager.hpp>
+#include <Geode/modify/MenuLayer.hpp>
+
+// A draggable circle: tap it to open or close the menu, drag it to move it
+class FloatingButton : public CCLayer {
+protected:
+    static constexpr float RADIUS = 22.f;
+    bool m_touching = false;
+    bool m_dragging = false;
+    CCPoint m_touchStart;   // where the finger went down
+    CCPoint m_grabOffset;   // button center minus finger position
+
+    bool init() override {
+        if (!CCLayer::init()) return false;
+
+        auto dot = CCDrawNode::create();
+        constexpr int SEGMENTS = 32;
+        CCPoint verts[SEGMENTS];
+        for (int i = 0; i < SEGMENTS; i++) {
+            float angle = (static_cast<float>(i) / SEGMENTS) * 2.f * static_cast<float>(M_PI);
+            verts[i] = ccp(std::cos(angle) * RADIUS, std::sin(angle) * RADIUS);
+        }
+        dot->drawPolygon(verts, SEGMENTS,
+            ccColor4F{0.55f, 0.25f, 0.95f, 0.75f}, 1.5f, ccColor4F{1.f, 1.f, 1.f, 0.9f});
+        this->addChild(dot);
+
+        auto label = CCLabelBMFont::create("V", "bigFont.fnt");
+        label->setScale(0.6f);
+        this->addChild(label);
+
+        auto winSize = CCDirector::get()->getWinSize();
+        this->setPosition(ccp(
+            Mod::get()->getSavedValue<float>("mobile-button-x", 40.f),
+            Mod::get()->getSavedValue<float>("mobile-button-y", winSize.height / 2.f)
+        ));
+
+        this->setTouchMode(kCCTouchesOneByOne);
+        this->setTouchPriority(-1000);  // above popups and the game's own touch handlers
+        this->setTouchEnabled(true);
+        return true;
+    }
+
+    CCPoint toParent(CCPoint world) {
+        return this->getParent() ? this->getParent()->convertToNodeSpace(world) : world;
+    }
+
+    bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
+        auto pos = this->toParent(touch->getLocation());
+        if (ccpDistance(pos, this->getPosition()) > RADIUS) return false;  // not on the circle
+
+        m_touching = true;
+        m_dragging = false;
+        m_touchStart = pos;
+        m_grabOffset = ccpSub(this->getPosition(), pos);
+        return true;
+    }
+
+    void ccTouchMoved(CCTouch* touch, CCEvent*) override {
+        if (!m_touching) return;
+        auto pos = this->toParent(touch->getLocation());
+
+        // Only count it as a drag after the finger has moved a bit
+        if (!m_dragging && ccpDistance(pos, m_touchStart) > 10.f) m_dragging = true;
+        if (!m_dragging) return;
+
+        auto winSize = CCDirector::get()->getWinSize();
+        auto target = ccpAdd(pos, m_grabOffset);
+        target.x = std::clamp(target.x, RADIUS, winSize.width - RADIUS);
+        target.y = std::clamp(target.y, RADIUS, winSize.height - RADIUS);
+        this->setPosition(target);
+    }
+
+    void ccTouchEnded(CCTouch*, CCEvent*) override {
+        if (!m_touching) return;
+        m_touching = false;
+
+        if (m_dragging) {
+            Mod::get()->setSavedValue<float>("mobile-button-x", this->getPositionX());
+            Mod::get()->setSavedValue<float>("mobile-button-y", this->getPositionY());
+        } else {
+            toggleHackMenu();
+        }
+    }
+
+    void ccTouchCancelled(CCTouch*, CCEvent*) override { m_touching = false; }
+
+public:
+    static FloatingButton* create() {
+        auto ret = new FloatingButton();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    // Creates the button once; the overlay keeps it alive across scene changes
+    static void ensure() {
+        static bool created = false;
+        if (created) return;
+        if (auto btn = FloatingButton::create()) {
+            OverlayManager::get()->addChild(btn, 9999);
+            created = true;
+        }
+    }
+};
+
+class $modify(HackMobileMenuLayer, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init()) return false;
+        FloatingButton::ensure();
+        return true;
+    }
+};
+#endif
 
 // ---- FPS + CPS Counters ----
 class FpsOverlay : public CCNode {
