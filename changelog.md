@@ -1,5 +1,9 @@
 # Violet's Mod Menu Changelog
 
+## 2.3.0-alpha.1
+
+- Android support. (Still in testing!)
+
 ## 2.2.0
 
 - Made 2 Player actually works with the Replay Bot!
