@@ -747,20 +747,30 @@ protected:
     bool init() override {
         if (!CCLayer::init()) return false;
 
-        auto dot = CCDrawNode::create();
-        constexpr int SEGMENTS = 32;
-        CCPoint verts[SEGMENTS];
-        for (int i = 0; i < SEGMENTS; i++) {
-            float angle = (static_cast<float>(i) / SEGMENTS) * 2.f * static_cast<float>(M_PI);
-            verts[i] = ccp(std::cos(angle) * RADIUS, std::sin(angle) * RADIUS);
-        }
-        dot->drawPolygon(verts, SEGMENTS,
-            ccColor4F{0.55f, 0.25f, 0.95f, 0.75f}, 1.5f, ccColor4F{1.f, 1.f, 1.f, 0.9f});
-        this->addChild(dot);
+        // The mod's icon, scaled to fit the circle's size
+        auto icon = CCSprite::create("menu-icon.png"_spr);
+        if (icon) {
+            float size = std::max(icon->getContentWidth(), icon->getContentHeight());
+            icon->setScale((RADIUS * 2.f) / size);
+            icon->setOpacity(220);  // slightly see-through so it doesn't block the level
+            this->addChild(icon);
+        } else {
+            // Fallback if the image didn't load: the old purple circle with a "V"
+            auto dot = CCDrawNode::create();
+            constexpr int SEGMENTS = 32;
+            CCPoint verts[SEGMENTS];
+            for (int i = 0; i < SEGMENTS; i++) {
+                float angle = (static_cast<float>(i) / SEGMENTS) * 2.f * static_cast<float>(M_PI);
+                verts[i] = ccp(std::cos(angle) * RADIUS, std::sin(angle) * RADIUS);
+            }
+            dot->drawPolygon(verts, SEGMENTS,
+                ccColor4F{0.55f, 0.25f, 0.95f, 0.75f}, 1.5f, ccColor4F{1.f, 1.f, 1.f, 0.9f});
+            this->addChild(dot);
 
-        auto label = CCLabelBMFont::create("V", "bigFont.fnt");
-        label->setScale(0.6f);
-        this->addChild(label);
+            auto label = CCLabelBMFont::create("V", "bigFont.fnt");
+            label->setScale(0.6f);
+            this->addChild(label);
+        }
 
         auto winSize = CCDirector::get()->getWinSize();
         this->setPosition(ccp(
@@ -1323,6 +1333,92 @@ static void openBotEditor() {
     if (auto popup = BotEditor::create(g_lastReplayName, actions, twoPlayer)) popup->show();
 }
 
+#ifdef GEODE_IS_MOBILE
+// ---- On-screen Frame Advance button ----
+class FrameStepButton : public CCLayer {
+protected:
+    static constexpr float RADIUS = 24.f;
+    bool m_touching = false;
+    CCSprite* m_arrow = nullptr;
+
+    bool init() override {
+        if (!CCLayer::init()) return false;
+
+        auto winSize = CCDirector::get()->getWinSize();
+        this->setPosition(ccp(winSize.width - 40.f, 45.f));  // bottom right
+
+        // Translucent circle behind the arrow so it's easy to see and hit
+        auto bg = CCDrawNode::create();
+        constexpr int SEGMENTS = 32;
+        CCPoint verts[SEGMENTS];
+        for (int i = 0; i < SEGMENTS; i++) {
+            float angle = (static_cast<float>(i) / SEGMENTS) * 2.f * static_cast<float>(M_PI);
+            verts[i] = ccp(std::cos(angle) * RADIUS, std::sin(angle) * RADIUS);
+        }
+        bg->drawPolygon(verts, SEGMENTS,
+            ccColor4F{0.f, 0.f, 0.f, 0.35f}, 1.f, ccColor4F{1.f, 1.f, 1.f, 0.6f});
+        this->addChild(bg);
+
+        m_arrow = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
+        m_arrow->setFlipX(true);  // points right: ">"
+        m_arrow->setScale(0.6f);
+        this->addChild(m_arrow);
+
+        this->setTouchMode(kCCTouchesOneByOne);
+        this->setTouchPriority(-100);
+        this->setTouchEnabled(true);
+        this->scheduleUpdate();
+        return true;
+    }
+
+    // Only visible while Frame Advance is switched on
+    void update(float) override {
+        bool on = hackOn("frame-advance");
+        this->setVisible(on);
+        if (!on && m_touching) this->release();
+    }
+
+    bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
+        if (!this->isVisible() || !hackOn("frame-advance")) return false;
+
+        auto parent = this->getParent();
+        auto pos = parent ? parent->convertToNodeSpace(touch->getLocation()) : touch->getLocation();
+        if (ccpDistance(pos, this->getPosition()) > RADIUS) return false;  // not on the circle
+
+        m_touching = true;
+        m_arrow->setScale(0.5f);
+
+        // Same as pressing H: one step now, then repeat while held
+        g_stepRequested = true;
+        g_hHeld = true;
+        g_holdTimer = 0.f;
+        g_repeatTimer = 0.f;
+        return true;
+    }
+
+    void release() {
+        if (!m_touching) return;
+        m_touching = false;
+        g_hHeld = false;
+        m_arrow->setScale(0.6f);
+    }
+
+    void ccTouchEnded(CCTouch*, CCEvent*) override { this->release(); }
+    void ccTouchCancelled(CCTouch*, CCEvent*) override { this->release(); }
+
+public:
+    static FrameStepButton* create() {
+        auto ret = new FrameStepButton();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+#endif
+
 // ---- Noclip + Show Hitboxes ----
 class $modify(HackPlayLayer, PlayLayer) {
     struct Fields {
@@ -1570,6 +1666,12 @@ class $modify(HackPlayLayer, PlayLayer) {
         if (auto overlay = FpsOverlay::create()) {
             m_uiLayer->addChild(overlay, 100);
         }
+
+        #ifdef GEODE_IS MOBILE
+        if (auto stepBtn = FrameStepButton::create()) {
+            m_uiLayer->addChild(stepBtn, 100);
+        }
+        #endif 
 
         g_frame = 0;
         g_checkpointFrames.clear();
