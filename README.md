@@ -6,7 +6,7 @@ Contains all the essentials, like  **Noclip**,  **Speedhack**, etc.
 
 ~~This mod is not publicly available. This mod is only available to whom I trust, and can hold this mod without sharing it without my permission.!~~
 
-It's public now! *(the in-game description isn't accurate, so ignore that.)*
+It's public now! Hooray!
 
 ## How to use
 
