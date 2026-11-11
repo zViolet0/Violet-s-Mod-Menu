@@ -10,7 +10,11 @@ It's public now! Hooray!
 
 ## How to use
 
+Windows:
 Press   `TAB`, then the menu will pop up.
+
+Android:
+Press the    `Menu Button`, then the menu will pop up.
 
 ## Compatibility
 

@@ -1,5 +1,12 @@
 # Violet's Mod Menu Changelog
 
+## 2.3.0
+
+- Full Android support!
+- Bug fixes!
+
+Last update before the big overhaul, so stay tuned for that!
+
 ## 2.3.0-alpha.1
 
 - Android support. (Still in testing!)

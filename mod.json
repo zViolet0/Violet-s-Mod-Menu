@@ -8,13 +8,14 @@
 	},
 	"id": "zviolet.violets-mod-menu",
 	"name": "Violet's Mod Menu",
-	"version": "v2.3.0-alpha.1",
+	"version": "v2.3.0",
 	"developer": "zViolet",
 	"description": "Simple personalized mod menu.",
 	"resources": {
         "files": [
             "resources/speed.jpg",
-            "resources/anger.mp3"
+            "resources/anger.mp3",
+			"resources/menu-icon.png"
         ]
     }
 }
